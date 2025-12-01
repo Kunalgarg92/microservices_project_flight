@@ -11,5 +11,4 @@ public class BookingServiceMicroAssignment1Application {
 	public static void main(String[] args) {
 		SpringApplication.run(BookingServiceMicroAssignment1Application.class, args);
 	}
-
 }

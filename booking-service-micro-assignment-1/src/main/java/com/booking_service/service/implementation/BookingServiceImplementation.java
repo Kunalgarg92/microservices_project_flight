@@ -3,6 +3,7 @@ package com.booking_service.service.implementation;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 
+import com.booking_service.event.BookingEvent;
 import com.booking_service.DTO.BookingRequest;
 import com.booking_service.DTO.BookingResponse;
 import com.booking_service.DTO.FlightResponseDto;
@@ -13,6 +14,7 @@ import com.booking_service.Model.BookingStatus;
 import com.booking_service.Model.BookingTicket;
 import com.booking_service.Model.Passenger;
 import com.booking_service.exception.ResourceNotFoundException;
+import com.booking_service.kafka.BookingEventProducer;
 import com.booking_service.repository.BookingRepository;
 import com.booking_service.repository.PassengerRepository;
 import com.booking_service.service.BookingService;
@@ -37,6 +39,10 @@ public class BookingServiceImplementation implements BookingService {
     @Autowired
     private FlightServiceClient flightClient;
 
+    @Autowired
+    private BookingEventProducer bookingEventProducer;
+
+    
     private static final Random RNG = new Random();
 
     @Override
@@ -58,9 +64,6 @@ public class BookingServiceImplementation implements BookingService {
             return Mono.error(new IllegalArgumentException("Duplicate seat numbers in request"));
         }
 
-        // ----------------------------
-        // FETCH FLIGHT (NON-BLOCKING)
-        // ----------------------------
         return Mono.fromCallable(() -> flightClient.getFlightById(flightId))
                 .subscribeOn(Schedulers.boundedElastic())
                 .flatMap(flight -> {
@@ -82,9 +85,7 @@ public class BookingServiceImplementation implements BookingService {
                         updateReq.setReason("BOOKING");
                         updateReq.setBookingId(pnr);
 
-                        // -----------------------------------------
-                        // REDUCE SEATS (NON-BLOCKING FEIGN CALL)
-                        // -----------------------------------------
+                        
                         return Mono.fromRunnable(() ->
                                 flightClient.reduceSeats(flightId, updateReq)
                         ).subscribeOn(Schedulers.boundedElastic())
@@ -96,7 +97,6 @@ public class BookingServiceImplementation implements BookingService {
                 });
     }
 
-    // SAVE BOOKING + PASSENGERS
     private Mono<BookingResponse> saveBookingAndPassengers(
             BookingRequest request,
             FlightResponseDto flight,
@@ -134,14 +134,19 @@ public class BookingServiceImplementation implements BookingService {
         return bookingRepo.save(booking)
                 .flatMap(savedBooking -> {
                     passengers.forEach(px -> px.setBookingId(savedBooking.getId()));
+
                     return passengerRepo.saveAll(passengers)
                             .collectList()
-                            .map(savedPassengers ->
-                                    buildBookingResponse(savedBooking, savedPassengers, "Booking successful"));
+                            .map(savedPassengers -> {
+                                BookingResponse response =
+                                        buildBookingResponse(savedBooking, savedPassengers, "Booking successful");
+                                BookingEvent event = convertToEvent(response);
+                                bookingEventProducer.publishBookingConfirmed(event);
+                                return response;
+                            });
                 });
     }
 
-    // GET BOOKING BY PNR
     @Override
     public Mono<BookingResponse> getBookingByPnr(String pnr) {
         return bookingRepo.findByPnr(pnr)
@@ -153,8 +158,6 @@ public class BookingServiceImplementation implements BookingService {
                                         buildBookingResponse(booking, passengers, "Ticket retrieved"))
                 );
     }
-
-    // BOOKING HISTORY
     @Override
     public Flux<BookingResponse> getBookingHistory(String email) {
         return bookingRepo.findByEmailOrderByBookingTimeDesc(email)
@@ -165,8 +168,6 @@ public class BookingServiceImplementation implements BookingService {
                                         buildBookingResponse(booking, passengers, "History item"))
                 );
     }
-
-    // CANCEL BOOKING
     @Override
     public Mono<Void> cancelBooking(String pnr) {
 
@@ -186,7 +187,6 @@ public class BookingServiceImplementation implements BookingService {
                 });
     }
 
-    // GENERATE PNR
     private Mono<String> generatePnr() {
         return Mono.just(randomAlphaNumeric(6));
     }
@@ -199,6 +199,33 @@ public class BookingServiceImplementation implements BookingService {
         }
         return sb.toString();
     }
+    
+    private BookingEvent convertToEvent(BookingResponse response) {
+
+        BookingEvent event = new BookingEvent();
+        event.setPnr(response.getPnr());
+        event.setEmail(response.getEmail());
+        event.setNumberOfSeats(response.getNumberOfSeats());
+        event.setTotalPrice(response.getTotalPrice());
+        event.setBookingTime(response.getBookingTime());
+        event.setMessage(response.getMessage());
+
+        event.setPassengers(response.getPassengers().stream().map(p -> {
+            BookingEvent.PassengerInfo info = new BookingEvent.PassengerInfo();
+            info.setName(p.name);
+            info.setSeatNumber(p.seatNumber);
+            info.setGender(p.gender);
+            info.setAge(p.age);
+            info.setMeal(p.meal);
+            info.setFareCategory(p.fareCategory);
+            info.setFareApplied(p.fareApplied);
+            info.setFareMessage(p.fareMessage);
+            return info;
+        }).toList());
+
+        return event;
+    }
+
 
     // BUILD RESPONSE
     private BookingResponse buildBookingResponse(BookingTicket booking,
